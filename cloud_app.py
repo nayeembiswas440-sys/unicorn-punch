@@ -2,14 +2,21 @@ import os
 import sqlite3
 import urllib.parse
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 import calendar
 from flask import Flask, request, redirect, jsonify
 
 app = Flask(__name__)
 DB_FILE = "cloud_attendance.db"
 
-# সিইও ও ম্যানেজারদের সিক্রেট পিন
+# সিইও ও ম্যানেজার সিক্রেট পিন
 ADMIN_PIN = "1234"
+
+# বাংলাদেশ টাইমজোন (GMT+6)
+DHAKA_TZ = ZoneInfo("Asia/Dhaka")
+
+def get_dhaka_now():
+    return datetime.now(DHAKA_TZ)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -40,7 +47,6 @@ def init_db():
                 base_salary REAL DEFAULT 0.0
             )
         """)
-        # প্রাথমিক কর্মী তথ্য (যদি অলরেডি না থাকে)
         initial_emps = [
             ('2542', 'Nayeem Biswas', '01650106943', 'General', 'Staff', 20000.0),
             ('256854', 'Anik Mia', '01590092227', 'Study Abroad', 'Reception', 15000.0),
@@ -59,14 +65,81 @@ init_db()
 def home():
     return "<div style='font-family:sans-serif; text-align:center; padding-top:50px;'><h2>Unicorn HRMS Cloud Server is Live 🚀</h2><p><a href='/admin' style='color:#2563EB; font-weight:bold;'>Go to CEO & Manager Admin Portal</a></p></div>"
 
-# --- CEO & MANAGER ADMIN PORTAL (LIVE + ABSENTS + PAYROLL) ---
+# --- TWO-WAY SYNC APIS FOR DESKTOP APP ---
+@app.route('/api/get_attendance')
+def get_attendance():
+    date_filter = request.args.get('date', '')
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    if date_filter:
+        cur.execute("SELECT employee_code, employee_name, attendance_date, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason FROM attendance_logs WHERE attendance_date = ?", (date_filter,))
+    else:
+        cur.execute("SELECT employee_code, employee_name, attendance_date, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason FROM attendance_logs ORDER BY attendance_date DESC LIMIT 500")
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for r in rows:
+        result.append({
+            "code": r[0], "name": r[1], "date": r[2],
+            "in_time": r[3], "lunch_start": r[4], "lunch_end": r[5],
+            "out_time": r[6], "status": r[7], "late_minutes": r[8],
+            "notes": r[9]
+        })
+    return jsonify(result)
+
+@app.route('/api/sync_attendance_from_desktop', methods=['POST'])
+def sync_attendance_from_desktop():
+    records = request.json or []
+    conn = sqlite3.connect(DB_FILE)
+    with conn:
+        for r in records:
+            conn.execute("""
+                INSERT INTO attendance_logs (
+                    employee_code, employee_name, attendance_date,
+                    in_time, lunch_start, lunch_end, out_time,
+                    status, late_minutes, correction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(employee_code, attendance_date) DO UPDATE SET
+                    in_time=coalesce(excluded.in_time, attendance_logs.in_time),
+                    lunch_start=coalesce(excluded.lunch_start, attendance_logs.lunch_start),
+                    lunch_end=coalesce(excluded.lunch_end, attendance_logs.lunch_end),
+                    out_time=coalesce(excluded.out_time, attendance_logs.out_time),
+                    status=coalesce(excluded.status, attendance_logs.status),
+                    late_minutes=coalesce(excluded.late_minutes, attendance_logs.late_minutes),
+                    correction_reason=coalesce(excluded.correction_reason, attendance_logs.correction_reason)
+            """, (
+                r.get('code'), r.get('name'), r.get('date'),
+                r.get('in_time'), r.get('lunch_start'), r.get('lunch_end'), r.get('out_time'),
+                r.get('status', 'PRESENT'), r.get('late_minutes', 0), r.get('notes', '')
+            ))
+    conn.close()
+    return jsonify({"status": "success", "count": len(records)})
+
+@app.route('/api/sync_employees', methods=['POST'])
+def sync_employees():
+    data = request.json or []
+    conn = sqlite3.connect(DB_FILE)
+    with conn:
+        for emp in data:
+            conn.execute("""
+                INSERT INTO employees_cache (code, name, phone, dept, desig, base_salary)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name=excluded.name, phone=excluded.phone, dept=excluded.dept,
+                    desig=excluded.desig, base_salary=excluded.base_salary
+            """, (emp.get('code'), emp.get('name'), emp.get('phone', ''), emp.get('dept', 'General'), emp.get('desig', 'Staff'), emp.get('base_salary', 0.0)))
+    conn.close()
+    return jsonify({"status": "ok", "synced": len(data)})
+
+# --- CEO & MANAGER ADMIN PORTAL ---
 @app.route('/admin')
 def admin_portal():
     entered_pin = request.args.get('pin', '')
     active_tab = request.args.get('tab', 'live')
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    today_str = get_dhaka_now().strftime('%Y-%m-%d')
     selected_date = request.args.get('date', today_str)
-    selected_month = request.args.get('month', datetime.now().strftime('%Y-%m'))
+    selected_month = request.args.get('month', get_dhaka_now().strftime('%Y-%m'))
 
     if entered_pin != ADMIN_PIN:
         return f"""<!DOCTYPE html>
@@ -99,11 +172,10 @@ def admin_portal():
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-
     cur.execute("SELECT code, name, phone, dept, desig, base_salary FROM employees_cache ORDER BY name ASC")
     employees = cur.fetchall()
 
-    # --- TAB 1: TODAY'S LIVE ATTENDANCE ---
+    # TAB 1: TODAY'S LIVE ATTENDANCE
     cur.execute("""
         SELECT employee_code, employee_name, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason
         FROM attendance_logs WHERE attendance_date = ?
@@ -159,11 +231,11 @@ def admin_portal():
             </tr>
             """
 
-    # --- TAB 2 & 3: MONTHLY ABSENT TRACKER & PAYROLL ENGINE ---
+    # TAB 2 & 3: MONTHLY ABSENT TRACKER & PAYROLL ENGINE
     year_val, month_val = map(int, selected_month.split('-'))
     num_days_in_month = calendar.monthrange(year_val, month_val)[1]
     
-    today_curr = datetime.now()
+    today_curr = get_dhaka_now()
     if today_curr.year == year_val and today_curr.month == month_val:
         days_passed = today_curr.day
     else:
@@ -195,13 +267,11 @@ def admin_portal():
         total_late_mins = sum([l[3] for l in logs if l[3]])
         late_days_count = sum([1 for l in logs if l[3] and l[3] > 0])
         
-        # ক্যালকুলেশন: কয়দিন এবসেন্ট ছিল
         absent_days_list = []
         for d in range(1, days_passed + 1):
             check_date_str = f"{selected_month}-{d:02d}"
-            # শুক্রবার সাপ্তাহিক ছুটি বাদ দিতে চাইলে:
-            cur_weekday = date(year_val, month_val, d).weekday() # 4 = Friday
-            if cur_weekday == 4:
+            cur_weekday = date(year_val, month_val, d).weekday()
+            if cur_weekday == 4: # Friday holiday
                 continue
             if check_date_str not in attended_dates:
                 absent_days_list.append(f"{d:02d} {calendar.month_abbr[month_val]}")
@@ -221,10 +291,8 @@ def admin_portal():
         </tr>
         """
 
-        # --- PAYROLL CALCULATION (30 Days Base) ---
         per_day_sal = base_sal / 30.0 if base_sal else 0.0
         absent_deduction = absent_count * per_day_sal
-        # ৩ দিন লেইট হলে ১ দিনের বেতন কাটা নীতি (প্রচলিত নিয়ম):
         late_deduction = (late_days_count // 3) * per_day_sal
         net_salary = max(0.0, base_sal - absent_deduction - late_deduction)
         total_payroll_cost += net_salary
@@ -303,7 +371,7 @@ def admin_portal():
 </body>
 </html>"""
 
-# --- EMPLOYEE PUNCH PORTAL & APIS ---
+# --- EMPLOYEE PUNCH PORTAL ---
 @app.route('/p/<code>')
 def employee_portal(code):
     msg = request.args.get('msg', '')
@@ -318,7 +386,7 @@ def employee_portal(code):
     desig = emp[1] if emp else "Staff"
     dept = emp[2] if emp else "Studio"
 
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    today_str = get_dhaka_now().strftime('%Y-%m-%d')
     cur.execute("SELECT in_time, lunch_start, lunch_end, out_time, correction_reason FROM attendance_logs WHERE employee_code = ? AND attendance_date = ?", (code, today_str))
     att = cur.fetchone()
     conn.close()
@@ -435,15 +503,16 @@ def employee_portal(code):
     <script>
         function updateClock() {{
             const now = new Date();
-            document.getElementById('clock').innerText = now.toLocaleTimeString('en-US', {{ hour12: true }});
-            document.getElementById('cdate').innerText = now.toLocaleDateString('en-US', {{ weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }});
+            document.getElementById('clock').innerText = now.toLocaleTimeString('en-US', {{ timeZone: 'Asia/Dhaka', hour12: true }});
+            document.getElementById('cdate').innerText = now.toLocaleDateString('en-US', {{ timeZone: 'Asia/Dhaka', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }});
         }}
         setInterval(updateClock, 1000);
         updateClock();
 
         function handleExitClick() {{
             const now = new Date();
-            const currentMins = now.getHours() * 60 + now.getMinutes();
+            const bdDate = new Date(now.toLocaleString("en-US", {{ timeZone: "Asia/Dhaka" }}));
+            const currentMins = bdDate.getHours() * 60 + bdDate.getMinutes();
             const targetMins = 18 * 60 + 30;
             if (currentMins < targetMins) {{
                 document.getElementById('earlyModal').style.display = 'flex';
@@ -480,15 +549,16 @@ def punch_action(code):
     row = cur.fetchone()
     emp_name = row[0] if row else f"Employee {code}"
 
-    now = datetime.now()
+    # বাংলাদেশ টাইমজোনে রিয়েল-টাইম ক্যালকুলেশন
+    now = get_dhaka_now()
     today_str = now.strftime('%Y-%m-%d')
     now_time_str = now.strftime('%I:%M %p')
     current_minute = now.hour * 60 + now.minute
 
-    OFFICE_START = 10 * 60
-    LUNCH_START_LIMIT = 13 * 60 + 15
-    LUNCH_END_LIMIT = 14 * 60 + 15
-    OFFICE_EXIT = 18 * 60 + 30
+    OFFICE_START = 10 * 60          # সকাল ১০:০০
+    LUNCH_START_LIMIT = 13 * 60 + 15 # দুপুর ১:১৫
+    LUNCH_END_LIMIT = 14 * 60 + 15   # দুপুর ২:১৫
+    OFFICE_EXIT = 18 * 60 + 30       # সন্ধ্যা ৬:৩০
 
     msg = "Punch recorded successfully!"
     alert_type = "success"
@@ -502,11 +572,11 @@ def punch_action(code):
         if action == 'in_time':
             if current_minute > OFFICE_START:
                 late_mins = current_minute - OFFICE_START
-                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়।"
+                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়। নিয়মিত সময়মতো অফিসে আসুন।"
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = ?, status = 'LATE' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, late_mins, code, today_str))
             else:
-                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন।"
+                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন। আজকের দিনটি সুন্দর হোক!"
                 alert_type = "success"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = 0, status = 'PRESENT' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -516,17 +586,17 @@ def punch_action(code):
                 msg = f"⏰ On-time break নিতে হবে! আপনি {late_break_mins} মিনিট দেরিতে ব্রেক শুরু করলেন।"
                 alert_type = "warning"
             else:
-                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে ডেস্কে ফিরুন।"
+                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে খাওয়া শেষ করে ডেস্কে ফিরুন।"
                 alert_type = "info"
             conn.execute("UPDATE attendance_logs SET lunch_start = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
         elif action == 'lunch_end':
             if current_minute > LUNCH_END_LIMIT:
                 late_end_mins = current_minute - LUNCH_END_LIMIT
-                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন!"
+                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন! এভাবে দেরি করা যাবে না।"
                 alert_type = "danger"
             else:
-                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন!"
+                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন! ওয়েল ডান!"
                 alert_type = "success"
             conn.execute("UPDATE attendance_logs SET lunch_end = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -538,7 +608,7 @@ def punch_action(code):
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET out_time = ?, correction_reason = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, reason_entry, code, today_str))
             else:
-                msg = "🎉 অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
+                msg = "🎉 আজ সারাদিন নিষ্ঠার সাথে কাজ করেছেন! অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
                 alert_type = "success"
                 conn.execute("UPDATE attendance_logs SET out_time = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
