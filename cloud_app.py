@@ -9,11 +9,9 @@ from flask import Flask, request, redirect, jsonify
 app = Flask(__name__)
 DB_FILE = "cloud_attendance.db"
 
-# সিইও ও ম্যানেজার সিক্রেট পিন
 ADMIN_PIN = "1234"
-
-# বাংলাদেশ টাইমজোন (GMT+6)
 DHAKA_TZ = ZoneInfo("Asia/Dhaka")
+SYSTEM_START_DATE = date(2026, 10, 12)
 
 def get_dhaka_now():
     return datetime.now(DHAKA_TZ)
@@ -65,7 +63,7 @@ init_db()
 def home():
     return "<div style='font-family:sans-serif; text-align:center; padding-top:50px;'><h2>Unicorn HRMS Cloud Server is Live 🚀</h2><p><a href='/admin' style='color:#2563EB; font-weight:bold;'>Go to CEO & Manager Admin Portal</a></p></div>"
 
-# --- TWO-WAY SYNC APIS FOR DESKTOP APP ---
+# --- TWO-WAY SYNC APIS ---
 @app.route('/api/get_attendance')
 def get_attendance():
     date_filter = request.args.get('date', '')
@@ -101,13 +99,13 @@ def sync_attendance_from_desktop():
                     status, late_minutes, correction_reason
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(employee_code, attendance_date) DO UPDATE SET
-                    in_time=coalesce(excluded.in_time, attendance_logs.in_time),
-                    lunch_start=coalesce(excluded.lunch_start, attendance_logs.lunch_start),
-                    lunch_end=coalesce(excluded.lunch_end, attendance_logs.lunch_end),
-                    out_time=coalesce(excluded.out_time, attendance_logs.out_time),
-                    status=coalesce(excluded.status, attendance_logs.status),
-                    late_minutes=coalesce(excluded.late_minutes, attendance_logs.late_minutes),
-                    correction_reason=coalesce(excluded.correction_reason, attendance_logs.correction_reason)
+                    in_time = excluded.in_time,
+                    lunch_start = excluded.lunch_start,
+                    lunch_end = excluded.lunch_end,
+                    out_time = excluded.out_time,
+                    status = excluded.status,
+                    late_minutes = excluded.late_minutes,
+                    correction_reason = excluded.correction_reason
             """, (
                 r.get('code'), r.get('name'), r.get('date'),
                 r.get('in_time'), r.get('lunch_start'), r.get('lunch_end'), r.get('out_time'),
@@ -155,7 +153,6 @@ def admin_portal():
         input {{ width: 100%; box-sizing: border-box; padding: 14px; border: 2px solid #E2E8F0; border-radius: 10px; font-size: 18px; text-align: center; letter-spacing: 6px; margin-bottom: 18px; outline:none; }}
         input:focus {{ border-color: #2563EB; }}
         button {{ width: 100%; padding: 14px; background: #2563EB; color: white; border: none; border-radius: 10px; font-weight: 700; font-size: 15px; cursor: pointer; }}
-        button:hover {{ background: #1D4ED8; }}
     </style>
 </head>
 <body>
@@ -190,7 +187,11 @@ def admin_portal():
     for emp in employees:
         code, name, phone, dept, desig, sal = emp
         rec = daily_records.get(code)
-        if rec:
+        
+        status_str = rec[6] if rec and rec[6] else ''
+        is_absent = (not rec) or ('ABSENT' in status_str.upper())
+
+        if rec and not is_absent:
             present_today += 1
             in_t = rec[2] or '--:--'
             l_out = rec[3] or '--:--'
@@ -227,11 +228,11 @@ def admin_portal():
             <tr style='background:#FFF1F2;'>
                 <td><b>{code}</b></td>
                 <td><b>{name}</b><br><small style='color:#64748B;'>{desig} • {dept}</small></td>
-                <td colspan='5' style='color:#E11D48; font-weight:bold; padding-left:20px;'>❌ ABSENT (এখনও উপস্থিতি রেকর্ড নেই)</td>
+                <td colspan='5' style='color:#E11D48; font-weight:bold; padding-left:20px;'>❌ ABSENT (অনুপস্থিত)</td>
             </tr>
             """
 
-    # TAB 2 & 3: MONTHLY ABSENT TRACKER & PAYROLL ENGINE
+    # TAB 2 & 3: MONTHLY & PAYROLL
     year_val, month_val = map(int, selected_month.split('-'))
     num_days_in_month = calendar.monthrange(year_val, month_val)[1]
     
@@ -262,18 +263,26 @@ def admin_portal():
         code, name, phone, dept, desig, base_sal = emp
         logs = emp_monthly_map.get(code, [])
         
-        attended_dates = set([l[1] for l in logs])
-        present_days = len(attended_dates)
-        total_late_mins = sum([l[3] for l in logs if l[3]])
-        late_days_count = sum([1 for l in logs if l[3] and l[3] > 0])
+        # Shudhu Present thaka date gulo count kora
+        present_dates = set([l[1] for l in logs if l[2] and 'ABSENT' not in l[2].upper()])
+        present_days = len(present_dates)
+        total_late_mins = sum([l[3] for l in logs if l[3] and 'ABSENT' not in (l[2] or '').upper()])
+        late_days_count = sum([1 for l in logs if l[3] and l[3] > 0 and 'ABSENT' not in (l[2] or '').upper()])
         
+        # Absent dates calculation
         absent_days_list = []
         for d in range(1, days_passed + 1):
+            check_date = date(year_val, month_val, d)
             check_date_str = f"{selected_month}-{d:02d}"
-            cur_weekday = date(year_val, month_val, d).weekday()
-            if cur_weekday == 4: # Friday holiday
+
+            if check_date.weekday() == 4: # Friday holiday
                 continue
-            if check_date_str not in attended_dates:
+
+            # System shuru howar aager date gulo absent dhora jabe na
+            if check_date < SYSTEM_START_DATE:
+                continue
+
+            if check_date_str not in present_dates:
                 absent_days_list.append(f"{d:02d} {calendar.month_abbr[month_val]}")
 
         absent_count = len(absent_days_list)
@@ -549,16 +558,15 @@ def punch_action(code):
     row = cur.fetchone()
     emp_name = row[0] if row else f"Employee {code}"
 
-    # বাংলাদেশ টাইমজোনে রিয়েল-টাইম ক্যালকুলেশন
     now = get_dhaka_now()
     today_str = now.strftime('%Y-%m-%d')
     now_time_str = now.strftime('%I:%M %p')
     current_minute = now.hour * 60 + now.minute
 
-    OFFICE_START = 10 * 60          # সকাল ১০:০০
-    LUNCH_START_LIMIT = 13 * 60 + 15 # দুপুর ১:১৫
-    LUNCH_END_LIMIT = 14 * 60 + 15   # দুপুর ২:১৫
-    OFFICE_EXIT = 18 * 60 + 30       # সন্ধ্যা ৬:৩০
+    OFFICE_START = 10 * 60
+    LUNCH_START_LIMIT = 13 * 60 + 15
+    LUNCH_END_LIMIT = 14 * 60 + 15
+    OFFICE_EXIT = 18 * 60 + 30
 
     msg = "Punch recorded successfully!"
     alert_type = "success"
@@ -572,11 +580,11 @@ def punch_action(code):
         if action == 'in_time':
             if current_minute > OFFICE_START:
                 late_mins = current_minute - OFFICE_START
-                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়। নিয়মিত সময়মতো অফিসে আসুন।"
+                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়।"
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = ?, status = 'LATE' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, late_mins, code, today_str))
             else:
-                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন। আজকের দিনটি সুন্দর হোক!"
+                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন।"
                 alert_type = "success"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = 0, status = 'PRESENT' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -586,17 +594,17 @@ def punch_action(code):
                 msg = f"⏰ On-time break নিতে হবে! আপনি {late_break_mins} মিনিট দেরিতে ব্রেক শুরু করলেন।"
                 alert_type = "warning"
             else:
-                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে খাওয়া শেষ করে ডেস্কে ফিরুন।"
+                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে ডেস্কে ফিরুন।"
                 alert_type = "info"
             conn.execute("UPDATE attendance_logs SET lunch_start = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
         elif action == 'lunch_end':
             if current_minute > LUNCH_END_LIMIT:
                 late_end_mins = current_minute - LUNCH_END_LIMIT
-                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন! এভাবে দেরি করা যাবে না।"
+                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন!"
                 alert_type = "danger"
             else:
-                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন! ওয়েল ডান!"
+                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন!"
                 alert_type = "success"
             conn.execute("UPDATE attendance_logs SET lunch_end = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -608,9 +616,9 @@ def punch_action(code):
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET out_time = ?, correction_reason = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, reason_entry, code, today_str))
             else:
-                msg = "🎉 আজ সারাদিন নিষ্ঠার সাথে কাজ করেছেন! অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
+                msg = "🎉 অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
                 alert_type = "success"
-                conn.execute("UPDATE attendance_logs SET out_time = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
+            conn.execute("UPDATE attendance_logs SET out_time = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
     conn.close()
     return redirect(f"/p/{code}?msg={urllib.parse.quote(msg)}&type={alert_type}")
