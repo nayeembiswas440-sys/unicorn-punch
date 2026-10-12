@@ -1,13 +1,14 @@
 import os
 import sqlite3
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 from flask import Flask, request, redirect, jsonify
 
 app = Flask(__name__)
 DB_FILE = "cloud_attendance.db"
 
-# ম্যানেজার এবং সিইও-দের জন্য গোপন পিন কোড
+# সিইও ও ম্যানেজারদের সিক্রেট পিন
 ADMIN_PIN = "1234"
 
 def init_db():
@@ -33,43 +34,61 @@ def init_db():
             CREATE TABLE IF NOT EXISTS employees_cache (
                 code TEXT PRIMARY KEY,
                 name TEXT,
+                phone TEXT,
+                dept TEXT,
                 desig TEXT,
-                dept TEXT
+                base_salary REAL DEFAULT 0.0
             )
         """)
+        # প্রাথমিক কর্মী তথ্য (যদি অলরেডি না থাকে)
+        initial_emps = [
+            ('2542', 'Nayeem Biswas', '01650106943', 'General', 'Staff', 20000.0),
+            ('256854', 'Anik Mia', '01590092227', 'Study Abroad', 'Reception', 15000.0),
+            ('25986', 'Sabbir Hossain', '01401337088', 'Study Abroad', 'Manager', 40000.0)
+        ]
+        for emp in initial_emps:
+            conn.execute("""
+                INSERT OR IGNORE INTO employees_cache (code, name, phone, dept, desig, base_salary)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, emp)
     conn.close()
 
 init_db()
 
 @app.route('/')
 def home():
-    return "<div style='font-family:sans-serif; text-align:center; padding-top:50px;'><h2>Unicorn HRMS Cloud Server is Live 🚀</h2><p><a href='/admin'>Go to CEO & Manager Live Dashboard</a></p></div>"
+    return "<div style='font-family:sans-serif; text-align:center; padding-top:50px;'><h2>Unicorn HRMS Cloud Server is Live 🚀</h2><p><a href='/admin' style='color:#2563EB; font-weight:bold;'>Go to CEO & Manager Admin Portal</a></p></div>"
 
-# --- CEO & MANAGER LIVE MONITORING PORTAL ---
+# --- CEO & MANAGER ADMIN PORTAL (LIVE + ABSENTS + PAYROLL) ---
 @app.route('/admin')
-def admin_dashboard():
+def admin_portal():
     entered_pin = request.args.get('pin', '')
-    selected_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+    active_tab = request.args.get('tab', 'live')
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    selected_date = request.args.get('date', today_str)
+    selected_month = request.args.get('month', datetime.now().strftime('%Y-%m'))
 
     if entered_pin != ADMIN_PIN:
         return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Management Access Portal</title>
+    <title>Management Login — Unicorn HRMS</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0F172A; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin:0; padding:20px; }}
-        .box {{ background: white; padding: 32px 28px; border-radius: 18px; max-width: 360px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.3); }}
-        h2 {{ color: #0F172A; margin-bottom: 6px; font-size: 20px; }}
-        p {{ color: #64748B; font-size: 13px; margin-bottom: 20px; }}
-        input {{ width: 100%; box-sizing: border-box; padding: 12px; border: 1.5px solid #CBD5E1; border-radius: 8px; font-size: 16px; text-align: center; letter-spacing: 4px; margin-bottom: 16px; outline:none; }}
-        button {{ width: 100%; padding: 12px; background: #2563EB; color: white; border: none; border-radius: 8px; font-weight: bold; font-size: 14px; cursor: pointer; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0F172A; display:flex; justify-content:center; align-items:center; min-height:100vh; margin:0; padding:20px; }}
+        .box {{ background: white; padding: 36px 30px; border-radius: 20px; max-width: 380px; width:100%; text-align:center; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }}
+        h2 {{ color: #0F172A; margin-bottom: 6px; font-size: 22px; font-weight:800; }}
+        p {{ color: #64748B; font-size: 13px; margin-bottom: 24px; }}
+        input {{ width: 100%; box-sizing: border-box; padding: 14px; border: 2px solid #E2E8F0; border-radius: 10px; font-size: 18px; text-align: center; letter-spacing: 6px; margin-bottom: 18px; outline:none; }}
+        input:focus {{ border-color: #2563EB; }}
+        button {{ width: 100%; padding: 14px; background: #2563EB; color: white; border: none; border-radius: 10px; font-weight: 700; font-size: 15px; cursor: pointer; }}
+        button:hover {{ background: #1D4ED8; }}
     </style>
 </head>
 <body>
     <div class="box">
-        <h2>🔒 Management Portal</h2>
-        <p>Enter 4-Digit Security PIN (Default: 1234)</p>
+        <h2>🔒 Executive Portal</h2>
+        <p>Enter 4-Digit Security PIN (Default: <b>1234</b>)</p>
         <form method="GET" action="/admin">
             <input type="password" name="pin" placeholder="••••" required autofocus>
             <button type="submit">Unlock Dashboard</button>
@@ -80,136 +99,211 @@ def admin_dashboard():
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
+
+    cur.execute("SELECT code, name, phone, dept, desig, base_salary FROM employees_cache ORDER BY name ASC")
+    employees = cur.fetchall()
+
+    # --- TAB 1: TODAY'S LIVE ATTENDANCE ---
     cur.execute("""
         SELECT employee_code, employee_name, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason
-        FROM attendance_logs
-        WHERE attendance_date = ?
-        ORDER BY in_time ASC
+        FROM attendance_logs WHERE attendance_date = ?
     """, (selected_date,))
-    rows = cur.fetchall()
+    daily_records = {r[0]: r for r in cur.fetchall()}
+
+    live_rows = ""
+    present_today = 0
+    late_today = 0
+    early_exit_today = 0
+
+    for emp in employees:
+        code, name, phone, dept, desig, sal = emp
+        rec = daily_records.get(code)
+        if rec:
+            present_today += 1
+            in_t = rec[2] or '--:--'
+            l_out = rec[3] or '--:--'
+            l_in = rec[4] or '--:--'
+            out_t = rec[5] or '--:--'
+            late_m = rec[7] or 0
+            reason = rec[8] or ''
+
+            if late_m > 0:
+                late_today += 1
+                status_badge = f"<span style='color:#DC2626; font-weight:bold;'>⚠️ {late_m}m Late</span>"
+            else:
+                status_badge = "<span style='color:#16A34A; font-weight:bold;'>On-Time</span>"
+
+            if reason:
+                early_exit_today += 1
+                reason_badge = f"<span style='background:#FEE2E2; color:#991B1B; padding:3px 8px; border-radius:6px; font-size:12px; font-weight:600;'>🏃‍♂️ {reason}</span>"
+            else:
+                reason_badge = "<span style='color:#94A3B8;'>—</span>"
+
+            live_rows += f"""
+            <tr>
+                <td><b>{code}</b></td>
+                <td><b>{name}</b><br><small style='color:#64748B;'>{desig} • {dept}</small></td>
+                <td><span style='color:#15803D; font-weight:bold;'>{in_t}</span><br>{status_badge}</td>
+                <td>{l_out}</td>
+                <td>{l_in}</td>
+                <td><span style='color:#B91C1C; font-weight:bold;'>{out_t}</span></td>
+                <td>{reason_badge}</td>
+            </tr>
+            """
+        else:
+            live_rows += f"""
+            <tr style='background:#FFF1F2;'>
+                <td><b>{code}</b></td>
+                <td><b>{name}</b><br><small style='color:#64748B;'>{desig} • {dept}</small></td>
+                <td colspan='5' style='color:#E11D48; font-weight:bold; padding-left:20px;'>❌ ABSENT (এখনও উপস্থিতি রেকর্ড নেই)</td>
+            </tr>
+            """
+
+    # --- TAB 2 & 3: MONTHLY ABSENT TRACKER & PAYROLL ENGINE ---
+    year_val, month_val = map(int, selected_month.split('-'))
+    num_days_in_month = calendar.monthrange(year_val, month_val)[1]
+    
+    today_curr = datetime.now()
+    if today_curr.year == year_val and today_curr.month == month_val:
+        days_passed = today_curr.day
+    else:
+        days_passed = num_days_in_month
+
+    cur.execute("""
+        SELECT employee_code, attendance_date, status, late_minutes 
+        FROM attendance_logs 
+        WHERE attendance_date LIKE ?
+    """, (f"{selected_month}%",))
+    monthly_logs = cur.fetchall()
     conn.close()
 
-    total_present = len(rows)
-    late_count = sum(1 for r in rows if r[6] == 'LATE' or (r[7] and r[7] > 0))
-    early_exit_count = sum(1 for r in rows if r[8] and len(r[8].strip()) > 0)
+    emp_monthly_map = {emp[0]: [] for emp in employees}
+    for m in monthly_logs:
+        if m[0] in emp_monthly_map:
+            emp_monthly_map[m[0]].append(m)
 
-    rows_html = ""
-    for r in rows:
-        code, name, in_t, l_out, l_in, out_t, st, late_m, reason = r
-        late_badge = f"<span style='color:#DC2626; font-weight:bold;'>⚠️ {late_m}m Late</span>" if late_m and late_m > 0 else "<span style='color:#16A34A; font-weight:bold;'>On-Time</span>"
-        reason_html = f"<span style='background:#FEE2E2; color:#991B1B; padding:3px 8px; border-radius:6px; font-size:12px; display:inline-block;'>🏃‍♂️ {reason}</span>" if reason else "<span style='color:#94A3B8;'>—</span>"
+    monthly_rows = ""
+    payroll_rows = ""
+    total_payroll_cost = 0
+
+    for emp in employees:
+        code, name, phone, dept, desig, base_sal = emp
+        logs = emp_monthly_map.get(code, [])
         
-        rows_html += f"""
+        attended_dates = set([l[1] for l in logs])
+        present_days = len(attended_dates)
+        total_late_mins = sum([l[3] for l in logs if l[3]])
+        late_days_count = sum([1 for l in logs if l[3] and l[3] > 0])
+        
+        # ক্যালকুলেশন: কয়দিন এবসেন্ট ছিল
+        absent_days_list = []
+        for d in range(1, days_passed + 1):
+            check_date_str = f"{selected_month}-{d:02d}"
+            # শুক্রবার সাপ্তাহিক ছুটি বাদ দিতে চাইলে:
+            cur_weekday = date(year_val, month_val, d).weekday() # 4 = Friday
+            if cur_weekday == 4:
+                continue
+            if check_date_str not in attended_dates:
+                absent_days_list.append(f"{d:02d} {calendar.month_abbr[month_val]}")
+
+        absent_count = len(absent_days_list)
+        absent_display = ", ".join(absent_days_list[:5])
+        if len(absent_days_list) > 5:
+            absent_display += f" ... (+{len(absent_days_list)-5} more)"
+
+        monthly_rows += f"""
         <tr>
             <td><b>{code}</b></td>
-            <td><b>{name}</b></td>
-            <td><span style='color:#15803D; font-weight:600;'>{in_t or '--:--'}</span> ({late_badge})</td>
-            <td>{l_out or '--:--'}</td>
-            <td>{l_in or '--:--'}</td>
-            <td><span style='color:#B91C1C; font-weight:600;'>{out_t or '--:--'}</span></td>
-            <td>{reason_html}</td>
+            <td><b>{name}</b><br><small style='color:#64748B;'>{dept}</small></td>
+            <td><span style='color:#15803D; font-weight:bold;'>{present_days} Days</span></td>
+            <td><span style='color:#DC2626; font-weight:bold;'>{absent_count} Days</span><br><small style='color:#64748B;'>({absent_display if absent_count else 'No Absents'})</small></td>
+            <td><span style='color:#D97706; font-weight:bold;'>{late_days_count} Times</span><br><small style='color:#64748B;'>({total_late_mins} mins total)</small></td>
         </tr>
         """
 
-    if not rows_html:
-        rows_html = "<tr><td colspan='7' style='text-align:center; padding:30px; color:#94A3B8;'>আজকের দিনে এখনো কেউ পাঞ্চ করেনি।</td></tr>"
+        # --- PAYROLL CALCULATION (30 Days Base) ---
+        per_day_sal = base_sal / 30.0 if base_sal else 0.0
+        absent_deduction = absent_count * per_day_sal
+        # ৩ দিন লেইট হলে ১ দিনের বেতন কাটা নীতি (প্রচলিত নিয়ম):
+        late_deduction = (late_days_count // 3) * per_day_sal
+        net_salary = max(0.0, base_sal - absent_deduction - late_deduction)
+        total_payroll_cost += net_salary
+
+        payroll_rows += f"""
+        <tr>
+            <td><b>{code}</b></td>
+            <td><b>{name}</b><br><small style='color:#64748B;'>{desig}</small></td>
+            <td><b>৳ {base_sal:,.2f}</b></td>
+            <td><span style='color:#DC2626;'>- ৳ {absent_deduction:,.2f}</span><br><small>({absent_count}d absent)</small></td>
+            <td><span style='color:#D97706;'>- ৳ {late_deduction:,.2f}</span><br><small>({late_days_count} late penalties)</small></td>
+            <td><span style='color:#16A34A; font-weight:800; font-size:15px;'>৳ {net_salary:,.2f}</span></td>
+        </tr>
+        """
 
     return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CEO & Manager Live Attendance Console</title>
+    <title>Executive Attendance & Payroll Console</title>
     <style>
         * {{ margin:0; padding:0; box-sizing:border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
-        body {{ background: #F8FAFC; color: #0F172A; padding: 20px; }}
-        .header {{ max-width: 1100px; margin: 0 auto 20px auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }}
-        .stats {{ max-width: 1100px; margin: 0 auto 20px auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }}
-        .card {{ background: white; padding: 18px; border-radius: 14px; border: 1px solid #E2E8F0; }}
+        body {{ background: #F8FAFC; color: #0F172A; padding: 24px 16px; }}
+        .header {{ max-width: 1200px; margin: 0 auto 24px auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }}
+        .nav-tabs {{ display: flex; gap: 8px; margin-bottom: 20px; max-width: 1200px; margin: 0 auto 20px auto; }}
+        .tab-btn {{ padding: 10px 18px; border-radius: 10px; text-decoration: none; font-weight: 700; font-size: 13.5px; border: 1.5px solid #CBD5E1; color: #475569; background: white; }}
+        .tab-btn.active {{ background: #0F172A; color: white; border-color: #0F172A; }}
+        .stats {{ max-width: 1200px; margin: 0 auto 20px auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }}
+        .card {{ background: white; padding: 20px; border-radius: 14px; border: 1px solid #E2E8F0; }}
         .num {{ font-size: 26px; font-weight: 800; margin-top: 4px; }}
-        .container {{ max-width: 1100px; margin: 0 auto; background: white; border-radius: 16px; border: 1px solid #E2E8F0; overflow-x: auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.03); }}
-        table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 13.5px; min-width: 750px; }}
-        th {{ background: #F1F5F9; color: #475569; padding: 14px 16px; font-weight: 700; border-bottom: 1px solid #E2E8F0; }}
-        td {{ padding: 14px 16px; border-bottom: 1px solid #F1F5F9; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; border-radius: 16px; border: 1px solid #E2E8F0; overflow-x: auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.04); }}
+        table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 13.5px; min-width: 800px; }}
+        th {{ background: #F1F5F9; color: #475569; padding: 14px 18px; font-weight: 700; border-bottom: 1px solid #E2E8F0; }}
+        td {{ padding: 14px 18px; border-bottom: 1px solid #F1F5F9; vertical-align: middle; }}
     </style>
 </head>
 <body>
     <div class="header">
         <div>
-            <h1 style="font-size:20px; font-weight:800;">Unicorn Live Attendance Board</h1>
-            <p style="font-size:12px; color:#64748B;">Manager & CEO Executive View</p>
+            <h1 style="font-size:22px; font-weight:800;">Unicorn Central Control</h1>
+            <p style="font-size:12px; color:#64748B;">CEO & Manager Cloud Dashboard</p>
         </div>
         <form method="GET" action="/admin" style="display:flex; gap:8px;">
             <input type="hidden" name="pin" value="{ADMIN_PIN}">
-            <input type="date" name="date" value="{selected_date}" style="padding:8px 12px; border:1px solid #CBD5E1; border-radius:8px;">
-            <button type="submit" style="padding:8px 14px; background:#0F172A; color:white; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Filter</button>
+            <input type="hidden" name="tab" value="{active_tab}">
+            {'<input type="date" name="date" value="' + selected_date + '" style="padding:8px 12px; border:1px solid #CBD5E1; border-radius:8px;">' if active_tab == 'live' else '<input type="month" name="month" value="' + selected_month + '" style="padding:8px 12px; border:1px solid #CBD5E1; border-radius:8px;">'}
+            <button type="submit" style="padding:8px 16px; background:#2563EB; color:white; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Filter</button>
         </form>
     </div>
 
-    <div class="stats">
-        <div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">TOTAL PRESENT</div><div class="num" style="color:#2563EB;">{total_present}</div></div>
-        <div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">LATE ARRIVALS</div><div class="num" style="color:#DC2626;">{late_count}</div></div>
-        <div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">EARLY EXITS</div><div class="num" style="color:#D97706;">{early_exit_count}</div></div>
+    <div class="nav-tabs">
+        <a href="/admin?pin={ADMIN_PIN}&tab=live&date={selected_date}" class="tab-btn {'active' if active_tab == 'live' else ''}">🕒 Live Today</a>
+        <a href="/admin?pin={ADMIN_PIN}&tab=absents&month={selected_month}" class="tab-btn {'active' if active_tab == 'absents' else ''}">📅 Monthly Attendance & Absents</a>
+        <a href="/admin?pin={ADMIN_PIN}&tab=payroll&month={selected_month}" class="tab-btn {'active' if active_tab == 'payroll' else ''}">💰 Payroll & Salary Sheet</a>
     </div>
+
+    {'<div class="stats"><div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">TOTAL PRESENT TODAY</div><div class="num" style="color:#16A34A;">' + str(present_today) + ' / ' + str(len(employees)) + '</div></div><div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">LATE ARRIVALS</div><div class="num" style="color:#DC2626;">' + str(late_today) + '</div></div><div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">EARLY DEPARTURES</div><div class="num" style="color:#D97706;">' + str(early_exit_today) + '</div></div></div>' if active_tab == 'live' else ''}
+
+    {'<div class="stats"><div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">PROJECTED PAYROLL DISBURSEMENT</div><div class="num" style="color:#2563EB;">৳ ' + f"{total_payroll_cost:,.2f}" + '</div></div><div class="card"><div style="font-size:11px; color:#64748B; font-weight:700;">ACTIVE STAFF MONITORED</div><div class="num" style="color:#0F172A;">' + str(len(employees)) + ' People</div></div></div>' if active_tab == 'payroll' else ''}
 
     <div class="container">
         <table>
-            <thead>
-                <tr>
-                    <th>Code</th>
-                    <th>Name</th>
-                    <th>Office In (10:00 AM)</th>
-                    <th>Lunch Out</th>
-                    <th>Lunch In (2:15 PM)</th>
-                    <th>Exit Time</th>
-                    <th>Early Exit Reason</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
+            {'''<thead>
+                <tr><th>Code</th><th>Name</th><th>Entry (10:00 AM)</th><th>Lunch Out</th><th>Lunch In (2:15 PM)</th><th>Exit Time</th><th>Early Reason</th></tr>
+            </thead><tbody>''' + live_rows + '</tbody>' if active_tab == 'live' else ''}
+
+            {'''<thead>
+                <tr><th>Code</th><th>Name</th><th>Total Present</th><th>Total Absent & Dates</th><th>Late Frequency</th></tr>
+            </thead><tbody>''' + monthly_rows + '</tbody>' if active_tab == 'absents' else ''}
+
+            {'''<thead>
+                <tr><th>Code</th><th>Name</th><th>Base Salary</th><th>Absent Deduction</th><th>Late Penalty</th><th>Net Payable Salary</th></tr>
+            </thead><tbody>''' + payroll_rows + '</tbody>' if active_tab == 'payroll' else ''}
         </table>
     </div>
 </body>
 </html>"""
 
 # --- EMPLOYEE PUNCH PORTAL & APIS ---
-@app.route('/api/sync_employees', methods=['POST'])
-def sync_employees():
-    data = request.json or []
-    conn = sqlite3.connect(DB_FILE)
-    with conn:
-        for emp in data:
-            conn.execute("""
-                INSERT INTO employees_cache (code, name, desig, dept)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(code) DO UPDATE SET
-                    name=excluded.name, desig=excluded.desig, dept=excluded.dept
-            """, (emp.get('code'), emp.get('name'), emp.get('desig', 'Staff'), emp.get('dept', 'General')))
-    conn.close()
-    return jsonify({"status": "ok", "synced": len(data)})
-
-@app.route('/api/get_attendance')
-def get_attendance():
-    date_filter = request.args.get('date', '')
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    if date_filter:
-        cur.execute("SELECT employee_code, employee_name, attendance_date, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason FROM attendance_logs WHERE attendance_date = ?", (date_filter,))
-    else:
-        cur.execute("SELECT employee_code, employee_name, attendance_date, in_time, lunch_start, lunch_end, out_time, status, late_minutes, correction_reason FROM attendance_logs ORDER BY attendance_date DESC LIMIT 500")
-    rows = cur.fetchall()
-    conn.close()
-
-    result = []
-    for r in rows:
-        result.append({
-            "code": r[0], "name": r[1], "date": r[2],
-            "in_time": r[3], "lunch_start": r[4], "lunch_end": r[5],
-            "out_time": r[6], "status": r[7], "late_minutes": r[8],
-            "notes": r[9]
-        })
-    return jsonify(result)
-
 @app.route('/p/<code>')
 def employee_portal(code):
     msg = request.args.get('msg', '')
@@ -408,11 +502,11 @@ def punch_action(code):
         if action == 'in_time':
             if current_minute > OFFICE_START:
                 late_mins = current_minute - OFFICE_START
-                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়। নিয়মিত সময়মতো অফিসে আসুন।"
+                msg = f"⚠️ আপনি {late_mins} মিনিট লেইট করেছেন! অফিস শুরু সকাল ১০:০০ টায়।"
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = ?, status = 'LATE' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, late_mins, code, today_str))
             else:
-                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন। আজকের দিনটি সুন্দর হোক!"
+                msg = "👏 দারুণ! একদম সময়মতো অফিসে উপস্থিত হয়েছেন।"
                 alert_type = "success"
                 conn.execute("UPDATE attendance_logs SET in_time = ?, late_minutes = 0, status = 'PRESENT' WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -422,17 +516,17 @@ def punch_action(code):
                 msg = f"⏰ On-time break নিতে হবে! আপনি {late_break_mins} মিনিট দেরিতে ব্রেক শুরু করলেন।"
                 alert_type = "warning"
             else:
-                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে খাওয়া শেষ করে ডেস্কে ফিরুন।"
+                msg = "🍱 লাঞ্চ ব্রেক শুরু হলো! দুপুর ২:১৫ PM এর মধ্যে ডেস্কে ফিরুন।"
                 alert_type = "info"
             conn.execute("UPDATE attendance_logs SET lunch_start = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
         elif action == 'lunch_end':
             if current_minute > LUNCH_END_LIMIT:
                 late_end_mins = current_minute - LUNCH_END_LIMIT
-                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন! এভাবে দেরি করা যাবে না।"
+                msg = f"⚠️ আপনি {late_end_mins} মিনিট দেরি করে ব্রেক শেষ করলেন!"
                 alert_type = "danger"
             else:
-                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন! ওয়েল ডান!"
+                msg = "✅ অন-টাইমে লাঞ্চ শেষ করে কাজে ফিরেছেন!"
                 alert_type = "success"
             conn.execute("UPDATE attendance_logs SET lunch_end = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
@@ -444,7 +538,7 @@ def punch_action(code):
                 alert_type = "warning"
                 conn.execute("UPDATE attendance_logs SET out_time = ?, correction_reason = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, reason_entry, code, today_str))
             else:
-                msg = "🎉 আজ সারাদিন নিষ্ঠার সাথে কাজ করেছেন! অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
+                msg = "🎉 অফিস ছুটি, সাবধানে বাড়ি পৌঁছান।"
                 alert_type = "success"
                 conn.execute("UPDATE attendance_logs SET out_time = ? WHERE employee_code = ? AND attendance_date = ?", (now_time_str, code, today_str))
 
